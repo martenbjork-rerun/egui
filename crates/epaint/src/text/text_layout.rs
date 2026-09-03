@@ -10,7 +10,7 @@ use crate::{
     stroke::PathStroke,
     text::{
         ByteIndex, ByteRange,
-        font::{StyledMetrics, UvRect, is_cjk, is_cjk_break_allowed, is_combining_mark},
+        font::{GlyphAllocation, StyledMetrics, is_cjk, is_cjk_break_allowed, is_combining_mark},
         fonts::FontFaceKey,
     },
 };
@@ -178,7 +178,7 @@ impl ShapingContext {
         physical_x: i32,
         advance_width_px: f32,
         face_metrics: &StyledMetrics,
-        uv_rect: UvRect,
+        alloc: GlyphAllocation,
     ) -> Glyph {
         Glyph {
             chr,
@@ -189,8 +189,8 @@ impl ShapingContext {
             font_face_ascent: face_metrics.ascent,
             font_height: self.font_metrics.row_height,
             font_ascent: self.font_metrics.ascent,
-            uv_rect,
-            is_color: false,
+            uv_rect: alloc.uv_rect,
+            is_color: alloc.is_color,
             section_index: self.section_index,
             first_vertex: 0,
         }
@@ -350,7 +350,7 @@ fn layout_shaped_run(
                     physical_x,
                     advance_width_px,
                     &fallback_metrics,
-                    glyph_alloc.uv_rect,
+                    glyph_alloc,
                 )
             }
         } else {
@@ -375,13 +375,7 @@ fn layout_shaped_run(
 
             paragraph.cursor_x_px += advance_width_px;
 
-            ctx.glyph(
-                chr,
-                physical_x,
-                advance_width_px,
-                face_metrics,
-                glyph_alloc.uv_rect,
-            )
+            ctx.glyph(chr, physical_x, advance_width_px, face_metrics, glyph_alloc)
         };
         paragraph.glyphs.push(glyph);
         cluster_glyph_count += 1;
@@ -410,15 +404,13 @@ fn raster_glyph(
 ) -> Glyph {
     let physical_x = paragraph.cursor_x_px.round() as i32;
     paragraph.cursor_x_px += raster.advance_px;
-    let mut glyph = ctx.glyph(
+    ctx.glyph(
         chr,
         physical_x,
         raster.advance_px,
         face_metrics,
-        raster.allocation.uv_rect,
-    );
-    glyph.is_color = raster.is_color;
-    glyph
+        raster.allocation,
+    )
 }
 
 /// Lay out a run whose clusters prefer the glyph rasterizer over the font.
@@ -517,9 +509,13 @@ fn emit_continuation_glyphs(
     let physical_x = paragraph.cursor_x_px.round() as i32;
 
     for chr in cluster_text.chars().skip(cluster_glyph_count) {
-        paragraph
-            .glyphs
-            .push(ctx.glyph(chr, physical_x, 0.0, face_metrics, UvRect::default()));
+        paragraph.glyphs.push(ctx.glyph(
+            chr,
+            physical_x,
+            0.0,
+            face_metrics,
+            GlyphAllocation::default(),
+        ));
     }
 }
 

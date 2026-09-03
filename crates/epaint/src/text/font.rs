@@ -23,7 +23,6 @@ use crate::{
 pub(crate) struct RasterGlyphAllocation {
     pub allocation: GlyphAllocation,
     pub advance_px: f32,
-    pub is_color: bool,
 }
 
 /// Hash of `(cluster, family, pixels_per_point, font_size)`,
@@ -192,6 +191,10 @@ impl SubpixelBin {
 pub struct GlyphAllocation {
     /// UV rectangle for drawing.
     pub uv_rect: UvRect,
+
+    /// A color glyph (e.g. emoji), stored with its own colors in the atlas.
+    /// Do not tint it with the text color.
+    pub is_color: bool,
 }
 
 #[derive(Hash, PartialEq, Eq)]
@@ -230,6 +233,13 @@ impl GlyphCacheKey {
 
 struct DependentFontData<'a> {
     skrifa: skrifa::FontRef<'a>,
+
+    #[cfg(feature = "color_fonts")]
+    index: u32,
+
+    /// Does the font have a `COLR`, `sbix`, `CBDT`, or `EBDT` table?
+    #[cfg(feature = "color_fonts")]
+    has_color_glyphs: bool,
     charmap: skrifa::charmap::Charmap<'a>,
     outline_glyphs: skrifa::outline::OutlineGlyphCollection<'a>,
     metrics: skrifa::metrics::Metrics,
@@ -264,6 +274,20 @@ impl FontCell {
             glyph_id != skrifa::GlyphId::NOTDEF,
             "Can't allocate glyph for id 0"
         );
+
+        // Color emoji fonts often have empty outlines next to their bitmap or `COLR` glyphs,
+        // so try those first:
+        core::cfg_select! {
+            feature = "color_fonts" => {
+                if self.borrow_dependent().has_color_glyphs
+                    && let Some(allocation) =
+                        self.allocate_color_glyph_uncached(atlas, metrics, glyph_id, bin, location)
+                {
+                    return Some(allocation);
+                }
+            }
+            _ => {}
+        }
 
         let mut path = kurbo::BezPath::new();
         let mut pen = VelloPen {
@@ -344,7 +368,119 @@ impl FontCell {
             }
         };
 
-        Some(GlyphAllocation { uv_rect })
+        Some(GlyphAllocation {
+            uv_rect,
+            is_color: false,
+        })
+    }
+
+    /// Rasterize a bitmap (`sbix`, `CBDT`) or `COLR` glyph, e.g. a color emoji.
+    ///
+    /// Returns `None` if the glyph has neither.
+    #[cfg(feature = "color_fonts")]
+    fn allocate_color_glyph_uncached(
+        &self,
+        atlas: &mut TextureAtlas,
+        metrics: &StyledMetrics,
+        glyph_id: GlyphId,
+        bin: SubpixelBin,
+        location: skrifa::instance::LocationRef<'_>,
+    ) -> Option<GlyphAllocation> {
+        use vello_cpu::peniko;
+
+        let font_data = self.borrow_dependent();
+        let font_size_px = metrics.scale;
+        let size = skrifa::instance::Size::new(font_size_px);
+
+        let has_color_glyph = font_data.skrifa.color_glyphs().get(glyph_id).is_some()
+            || font_data
+                .skrifa
+                .bitmap_strikes()
+                .glyph_for_size(size, glyph_id)
+                .is_some();
+        if !(has_color_glyph && 0.0 < font_size_px && font_size_px.is_finite()) {
+            return None;
+        }
+
+        // We don't know the bounds of the glyph up front, so we render it onto a
+        // canvas with room for one em on each side of the em box, then crop.
+        let canvas_size = (3.0 * font_size_px)
+            .ceil()
+            .clamp(1.0, MAX_GLYPH_SIZE as f32) as u16;
+        let origin_x = font_size_px as f64 + bin.as_float() as f64;
+        let origin_y = 2.0 * font_size_px as f64;
+
+        let font = peniko::FontData::new(
+            peniko::Blob::new(std::sync::Arc::clone(self.borrow_owner())),
+            font_data.index,
+        );
+        let coords: Vec<i16> = location.coords().iter().map(|c| c.to_bits()).collect();
+
+        let mut ctx = vello_cpu::RenderContext::new(canvas_size, canvas_size);
+        let mut resources = vello_cpu::Resources::new();
+        ctx.set_paint(color::OpaqueColor::<color::Srgb>::WHITE);
+        ctx.glyph_run(&mut resources, &font)
+            .font_size(font_size_px)
+            .hint(false)
+            .normalized_coords(&coords)
+            .fill_glyphs(core::iter::once(vello_cpu::Glyph {
+                id: glyph_id.to_u32(),
+                x: origin_x as f32,
+                y: origin_y as f32,
+            }));
+        let mut pixmap = vello_cpu::Pixmap::new(canvas_size, canvas_size);
+        ctx.render(&mut pixmap, &mut resources);
+
+        let canvas_size = canvas_size as usize;
+        let pixels = pixmap.data_as_u8_slice();
+        let alpha_at = |x: usize, y: usize| pixels[4 * (y * canvas_size + x) + 3];
+
+        // Crop to the painted pixels:
+        let mut min = [canvas_size, canvas_size];
+        let mut max = [0, 0];
+        for y in 0..canvas_size {
+            for x in 0..canvas_size {
+                if alpha_at(x, y) != 0 {
+                    min = [min[0].min(x), min[1].min(y)];
+                    max = [max[0].max(x + 1), max[1].max(y + 1)];
+                }
+            }
+        }
+        if max[0] <= min[0] || max[1] <= min[1] {
+            return None; // Nothing painted
+        }
+        let width = max[0] - min[0];
+        let height = max[1] - min[1];
+
+        let (glyph_pos, image) = atlas.allocate((width, height));
+        for y in 0..height {
+            for x in 0..width {
+                let pixel_offset = 4 * ((y + min[1]) * canvas_size + x + min[0]);
+                // Color glyphs skip the color transfer function, which assumes white coverage glyphs.
+                image[(x + glyph_pos.0, y + glyph_pos.1)] = Color32::from_rgba_premultiplied(
+                    pixels[pixel_offset],
+                    pixels[pixel_offset + 1],
+                    pixels[pixel_offset + 2],
+                    pixels[pixel_offset + 3],
+                );
+            }
+        }
+
+        let offset_in_pixels = vec2(
+            min[0] as f32 - origin_x as f32,
+            min[1] as f32 - origin_y as f32,
+        );
+        let offset =
+            offset_in_pixels / metrics.pixels_per_point + metrics.y_offset_in_points * Vec2::Y;
+        Some(GlyphAllocation {
+            uv_rect: UvRect {
+                offset,
+                size: vec2(width as f32, height as f32) / metrics.pixels_per_point,
+                min: [glyph_pos.0 as u16, glyph_pos.1 as u16],
+                max: [(glyph_pos.0 + width) as u16, (glyph_pos.1 + height) as u16],
+            },
+            is_color: true,
+        })
     }
 }
 
@@ -448,8 +584,21 @@ impl FontFace {
                 })
                 .flatten();
 
+            #[cfg(feature = "color_fonts")]
+            let has_color_glyphs = {
+                use skrifa::raw::TableProvider as _;
+                skrifa_font.colr().is_ok()
+                    || skrifa_font.sbix().is_ok()
+                    || skrifa_font.cbdt().is_ok()
+                    || skrifa_font.ebdt().is_ok()
+            };
+
             Ok::<DependentFontData<'_>, Box<dyn core::error::Error>>(DependentFontData {
                 skrifa: skrifa_font,
+                #[cfg(feature = "color_fonts")]
+                index,
+                #[cfg(feature = "color_fonts")]
+                has_color_glyphs,
                 charmap,
                 outline_glyphs: glyphs,
                 metrics,
@@ -771,9 +920,9 @@ impl Font<'_> {
                     min: [glyph_pos.0 as u16, glyph_pos.1 as u16],
                     max: [(glyph_pos.0 + width) as u16, (glyph_pos.1 + height) as u16],
                 },
+                is_color: glyph.is_color,
             },
             advance_px: glyph.advance_px,
-            is_color: glyph.is_color,
         })
     }
 
