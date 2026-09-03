@@ -219,12 +219,9 @@ mod has_emoji_presentation_tests {
 /// Input to a [`FontProvider`].
 pub struct FallbackRequest<'a> {
     /// A grapheme cluster that no installed font can render.
-    pub cluster: &'a str,
-
-    /// The first character of [`Self::cluster`].
     ///
-    /// The returned font must have a glyph for it.
-    pub base_char: char,
+    /// The returned font must have a glyph for its first character.
+    pub cluster: &'a str,
 
     /// The requested font family.
     pub family: &'a FontFamily,
@@ -241,7 +238,7 @@ pub struct FallbackRequest<'a> {
 ///
 /// Any `Fn(&FallbackRequest<'_>) -> Option<FontInsert>` is a [`FontProvider`].
 pub trait FontProvider: Send + Sync {
-    /// Find a font with a glyph for `request.base_char`.
+    /// Find a font with a glyph for the first character of `request.cluster`.
     ///
     /// Called at most once per (family, character), also when returning `None`,
     /// until the [`FontDefinitions`] change.
@@ -1783,14 +1780,14 @@ mod font_provider_tests {
 
     /// A provider that records its requests, and returns `NotoEmoji` for everything if `provide`.
     fn recording_provider(
-        requests: &Arc<Mutex<Vec<(FontFamily, char)>>>,
+        requests: &Arc<Mutex<Vec<(FontFamily, String)>>>,
         provide: bool,
     ) -> Arc<dyn FontProvider> {
         let requests = Arc::clone(requests);
         Arc::new(move |request: &FallbackRequest<'_>| {
             requests
                 .lock()
-                .push((request.family.clone(), request.base_char));
+                .push((request.family.clone(), request.cluster.to_owned()));
             provide.then(|| {
                 FontInsert::new(
                     "provided:NotoEmoji",
@@ -1838,7 +1835,10 @@ mod font_provider_tests {
         assert!(fonts.has_glyph(&font_id, EMOJI));
         assert!(fonts.has_glyph(&font_id, EMOJI));
         assert!(fonts.has_glyph(&font_id, 'a'));
-        assert_eq!(*requests.lock(), vec![(FontFamily::Proportional, EMOJI)]);
+        assert_eq!(
+            *requests.lock(),
+            vec![(FontFamily::Proportional, EMOJI.to_string())]
+        );
         assert_eq!(fonts.provided_fonts().len(), 1);
 
         let glyph = first_glyph(&mut fonts, EMOJI);
@@ -1864,8 +1864,8 @@ mod font_provider_tests {
         assert_eq!(
             *requests.lock(),
             vec![
-                (FontFamily::Proportional, HANGUL),
-                (FontFamily::Monospace, HANGUL),
+                (FontFamily::Proportional, HANGUL.to_string()),
+                (FontFamily::Monospace, HANGUL.to_string()),
             ]
         );
         assert!(fonts.provided_fonts().is_empty());

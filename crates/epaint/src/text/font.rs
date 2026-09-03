@@ -895,7 +895,6 @@ impl Font<'_> {
 
         let request = FallbackRequest {
             cluster,
-            base_char,
             family: &self.family,
         };
 
