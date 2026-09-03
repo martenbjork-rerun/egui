@@ -1032,6 +1032,7 @@ impl Fonts {
     /// Ask these for fonts for characters that no font in the [`FontDefinitions`] has.
     ///
     /// The providers are asked in order, and the first font found is used.
+    #[inline]
     pub fn with_font_providers(mut self, font_providers: Vec<Arc<dyn FontProvider>>) -> Self {
         self.fonts.set_font_providers(font_providers.clone());
         self.font_providers = font_providers;
