@@ -1,5 +1,5 @@
 use core::sync::atomic::{AtomicUsize, Ordering};
-use std::{borrow::Cow, collections::BTreeMap, sync::Arc};
+use std::{collections::BTreeMap, sync::Arc};
 
 use crate::{
     Color32, ColorImage, TextureAtlas,
@@ -295,12 +295,20 @@ impl core::fmt::Display for FontFamily {
 
 // ----------------------------------------------------------------------------
 
+/// Shared, immutable bytes of a font file.
+///
+/// Cheap to clone. Can wrap static bytes, a `Vec<u8>`, or a memory-mapped file.
+pub type Blob = Arc<dyn AsRef<[u8]> + Send + Sync>;
+
 /// A `.ttf` or `.otf` file and a font face index.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 pub struct FontData {
     /// The content of a `.ttf` or `.otf` file.
-    pub font: Cow<'static, [u8]>,
+    ///
+    /// Shared, so that cloning a [`FontData`] does not copy the file.
+    #[cfg_attr(feature = "serde", serde(with = "blob_serde"))]
+    pub font: Blob,
 
     /// Which font face in the file to use.
     /// When in doubt, use `0`.
@@ -312,23 +320,30 @@ pub struct FontData {
 
 impl FontData {
     pub fn from_static(font: &'static [u8]) -> Self {
-        Self {
-            font: Cow::Borrowed(font),
-            index: 0,
-            tweak: Default::default(),
-        }
+        Self::from_blob(Arc::new(font), 0)
     }
 
     pub fn from_owned(font: Vec<u8>) -> Self {
+        Self::from_blob(Arc::new(font), 0)
+    }
+
+    /// Use already shared bytes, e.g. a memory-mapped system font file, without copying them.
+    pub fn from_blob(font: Blob, index: u32) -> Self {
         Self {
-            font: Cow::Owned(font),
-            index: 0,
+            font,
+            index,
             tweak: Default::default(),
         }
     }
 
     pub fn tweak(self, tweak: FontTweak) -> Self {
         Self { tweak, ..self }
+    }
+
+    /// The content of the font file.
+    #[inline]
+    pub fn bytes(&self) -> &[u8] {
+        (*self.font).as_ref()
     }
 
     /// The variation axes of this font, e.g. `wght` (weight) and `wdth` (width).
@@ -342,7 +357,7 @@ impl FontData {
     pub fn variation_axes(&self) -> Vec<FontVariationAxis> {
         use skrifa::MetadataProvider as _;
 
-        let Ok(font) = skrifa::FontRef::from_index(self.font.as_ref(), self.index) else {
+        let Ok(font) = skrifa::FontRef::from_index(self.bytes(), self.index) else {
             return Vec::new();
         };
 
@@ -385,7 +400,43 @@ pub struct FontVariationAxis {
 
 impl AsRef<[u8]> for FontData {
     fn as_ref(&self) -> &[u8] {
-        self.font.as_ref()
+        self.bytes()
+    }
+}
+
+impl PartialEq for FontData {
+    fn eq(&self, other: &Self) -> bool {
+        let Self { font, index, tweak } = self;
+        *index == other.index
+            && *tweak == other.tweak
+            && (Arc::ptr_eq(font, &other.font) || self.bytes() == other.bytes())
+    }
+}
+
+impl core::fmt::Debug for FontData {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let Self { font, index, tweak } = self;
+        f.debug_struct("FontData")
+            .field("font", &format_args!("{} bytes", (**font).as_ref().len()))
+            .field("index", index)
+            .field("tweak", tweak)
+            .finish()
+    }
+}
+
+#[cfg(feature = "serde")]
+mod blob_serde {
+    use super::Blob;
+
+    pub fn serialize<S: serde::Serializer>(blob: &Blob, serializer: S) -> Result<S::Ok, S::Error> {
+        serde::Serialize::serialize((**blob).as_ref(), serializer)
+    }
+
+    pub fn deserialize<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Blob, D::Error> {
+        let bytes: Vec<u8> = serde::Deserialize::deserialize(deserializer)?;
+        Ok(std::sync::Arc::new(bytes))
     }
 }
 
@@ -574,15 +625,6 @@ impl Default for SmoothHinting {
 }
 
 // ----------------------------------------------------------------------------
-
-pub type Blob = Arc<dyn AsRef<[u8]> + Send + Sync>;
-
-fn blob_from_font_data(data: &FontData) -> Blob {
-    match data.clone().font {
-        Cow::Borrowed(bytes) => Arc::new(bytes) as Blob,
-        Cow::Owned(bytes) => Arc::new(bytes) as Blob,
-    }
-}
 
 /// Describes the font data and the sizes to use.
 ///
@@ -1204,11 +1246,10 @@ impl FontsImpl {
         let mut fonts_by_id: nohash_hasher::IntMap<FontFaceKey, FontFace> = Default::default();
         let mut fonts_by_name: ahash::HashMap<String, FontFaceKey> = Default::default();
         for (name, font_data) in &definitions.font_data {
-            let blob = blob_from_font_data(font_data);
             let font_face = FontFace::new(
                 options,
                 name.clone(),
-                blob,
+                Arc::clone(&font_data.font),
                 font_data.index,
                 font_data.tweak.clone(),
             )
