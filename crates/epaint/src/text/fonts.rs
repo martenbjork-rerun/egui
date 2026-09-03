@@ -70,42 +70,11 @@ pub struct RasterizedGlyph {
 type RasterizeFn =
     dyn for<'a> Fn(&GlyphRasterizerRequest<'a>) -> Option<RasterizedGlyph> + Send + Sync;
 
-/// Where to look first for the glyphs of a grapheme cluster.
-///
-/// The other source is used as a fallback if the first one cannot render the cluster.
-///
-/// See [`GlyphSourcePreference`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum GlyphSource {
-    /// The fonts in [`FontDefinitions`].
-    ///
-    /// Predictable: looks the same everywhere, both on native and on web.
-    Fonts,
-
-    /// What the platform offers: fonts from the [`FontProvider`]s (e.g. the system fonts
-    /// on native), and the [`GlyphRasterizer`] (e.g. the browser on web).
-    ///
-    /// Supports colored emojis.
-    /// Unpredictable: may look different on different computers.
-    Platform,
-}
-
-/// Decides where to look first for the glyphs of each grapheme cluster.
-///
-/// Default: [`default_glyph_source`], so that color emoji come from the platform,
-/// while text-presentation symbols (e.g. ⏮︎) look the same on all platforms.
-///
-/// Use `|_| GlyphSource::Fonts` to only use the platform for clusters
-/// that no font in [`FontDefinitions`] can render.
-///
-/// Set with `egui::Context::set_glyph_source_preference` or [`Fonts::with_glyph_source_preference`].
-pub type GlyphSourcePreference = Arc<dyn Fn(&str) -> GlyphSource + Send + Sync>;
-
 /// Rasterizes grapheme clusters using something other than the installed fonts,
 /// e.g. the browser on web.
 ///
-/// Used for clusters no installed font can render,
-/// and for clusters where the [`GlyphSourcePreference`] says [`GlyphSource::Platform`].
+/// Used for clusters that no installed font can render,
+/// after the [`FontProvider`]s have been asked for a font for them.
 #[derive(Clone)]
 pub struct GlyphRasterizer {
     /// Rasterize one grapheme cluster.
@@ -127,96 +96,9 @@ impl GlyphRasterizer {
     }
 }
 
-/// The default [`GlyphSourcePreference`]:
-/// [`GlyphSource::Platform`] for clusters with emoji presentation
-/// (see [`has_emoji_presentation`]), [`GlyphSource::Fonts`] for everything else.
-pub fn default_glyph_source(cluster: &str) -> GlyphSource {
-    if has_emoji_presentation(cluster) {
-        GlyphSource::Platform
-    } else {
-        GlyphSource::Fonts
-    }
-}
-
 impl core::fmt::Debug for GlyphRasterizer {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str("GlyphRasterizer")
-    }
-}
-
-/// Does this grapheme cluster have emoji presentation, per Unicode (UTS #51)?
-///
-/// True for clusters that default to a color glyph (😀, 🦀, 🇸🇪, 👨‍👩‍👧),
-/// for clusters with an explicit emoji presentation selector (⏮️, U+FE0F),
-/// and for emoji modifier (skin tone) sequences (☝🏻).
-///
-/// False for text-presentation symbols (⏮, ✔, ♥) and for clusters
-/// with an explicit text presentation selector (⏮︎, U+FE0E).
-///
-/// Used by [`default_glyph_source`].
-pub fn has_emoji_presentation(cluster: &str) -> bool {
-    use unicode_properties::emoji::{
-        EmojiStatus, UnicodeEmoji as _, is_emoji_presentation_selector,
-        is_text_presentation_selector,
-    };
-
-    if cluster.is_ascii() {
-        return false; // Fast path: no ASCII character has emoji presentation.
-    }
-
-    let mut has_emoji_presentation = false;
-    for c in cluster.chars() {
-        if is_text_presentation_selector(c) {
-            return false; // Explicit text presentation wins.
-        }
-        has_emoji_presentation |= is_emoji_presentation_selector(c)
-            || matches!(
-                c.emoji_status(),
-                EmojiStatus::EmojiPresentation
-                    | EmojiStatus::EmojiPresentationAndModifierBase
-                    | EmojiStatus::EmojiPresentationAndEmojiComponent
-                    | EmojiStatus::EmojiPresentationAndModifierAndEmojiComponent
-            );
-    }
-    has_emoji_presentation
-}
-
-#[cfg(test)]
-mod has_emoji_presentation_tests {
-    use super::has_emoji_presentation;
-
-    #[test]
-    fn emoji_presentation() {
-        for cluster in [
-            "😀",
-            "🦀",
-            "⏮\u{FE0F}",              // explicit emoji presentation
-            "☝🏻",                     // skin tone modifier sequence
-            "🇸🇪",                     // flag
-            "👨\u{200D}👩\u{200D}👧", // ZWJ sequence
-            "1\u{FE0F}\u{20E3}",      // keycap
-        ] {
-            assert!(has_emoji_presentation(cluster), "{cluster:?}");
-        }
-    }
-
-    #[test]
-    fn text_presentation() {
-        for cluster in [
-            "",
-            "a",
-            "1",
-            "⏮",
-            "⏮\u{FE0E}",  // explicit text presentation
-            "😀\u{FE0E}", // explicit text presentation wins
-            "✔",
-            "♥",
-            "©",
-            "→",
-            "√",
-        ] {
-            assert!(!has_emoji_presentation(cluster), "{cluster:?}");
-        }
     }
 }
 
@@ -911,9 +793,6 @@ pub(super) struct CachedFamily {
     /// The fonts from the [`FontDefinitions`] first, then the ones found by the [`FontProvider`]s.
     pub fonts: Vec<FontFaceKey>,
 
-    /// How many of [`Self::fonts`] come from the [`FontDefinitions`].
-    pub num_definition_fonts: usize,
-
     /// Lazily calculated.
     pub characters: Option<BTreeMap<char, Vec<String>>>,
 
@@ -926,26 +805,21 @@ pub(super) struct CachedFamily {
     /// render this char in its place.
     pub replacement_char: char,
 
-    /// Cache: `(where to look first, char) → which face in the fallback chain owns this char`.
+    /// Cache: `char → which face in the fallback chain owns this char`.
     ///
     /// Location-independent (fallback choice depends only on charmap support,
     /// not on variation coordinates).
-    pub face_cache: ahash::HashMap<(GlyphSource, char), FontFaceKey>,
+    pub face_cache: ahash::HashMap<char, FontFaceKey>,
 }
 
 impl CachedFamily {
-    fn new(
-        fonts: Vec<FontFaceKey>,
-        num_definition_fonts: usize,
-        fonts_by_id: &mut IntMap<FontFaceKey, FontFace>,
-    ) -> Self {
+    fn new(fonts: Vec<FontFaceKey>, fonts_by_id: &mut IntMap<FontFaceKey, FontFace>) -> Self {
         const PRIMARY_REPLACEMENT_CHAR: char = '◻'; // white medium square
         const FALLBACK_REPLACEMENT_CHAR: char = '?'; // fallback for the fallback
 
         if fonts.is_empty() {
             return Self {
                 fonts,
-                num_definition_fonts,
                 characters: None,
                 replacement_face_key: FontFaceKey::INVALID,
                 replacement_char: PRIMARY_REPLACEMENT_CHAR,
@@ -955,7 +829,6 @@ impl CachedFamily {
 
         let mut slf = Self {
             fonts,
-            num_definition_fonts,
             characters: None,
             replacement_face_key: FontFaceKey::INVALID,
             replacement_char: PRIMARY_REPLACEMENT_CHAR,
@@ -990,16 +863,7 @@ impl CachedFamily {
         c: char,
         fonts_by_id: &mut IntMap<FontFaceKey, FontFace>,
     ) -> Option<FontFaceKey> {
-        Self::find_face_for_char_in(&self.fonts, c, fonts_by_id)
-    }
-
-    /// The first of `fonts` whose charmap supports `c`.
-    pub(crate) fn find_face_for_char_in(
-        fonts: &[FontFaceKey],
-        c: char,
-        fonts_by_id: &mut IntMap<FontFaceKey, FontFace>,
-    ) -> Option<FontFaceKey> {
-        for font_key in fonts {
+        for font_key in &self.fonts {
             let font_face = fonts_by_id.get_mut(font_key).expect("Nonexistent font ID");
             if font_face.glyph_id_resolution(c).is_some() {
                 return Some(*font_key);
@@ -1044,18 +908,6 @@ impl Fonts {
         }
     }
 
-    /// Decide where to look first for the glyphs of each grapheme cluster.
-    ///
-    /// See [`GlyphSourcePreference`].
-    #[inline]
-    pub fn with_glyph_source_preference(
-        mut self,
-        prefer: impl Fn(&str) -> GlyphSource + Send + Sync + 'static,
-    ) -> Self {
-        self.fonts.set_glyph_source_preference(prefer);
-        self
-    }
-
     /// Ask these for fonts for characters that no font in the [`FontDefinitions`] has.
     ///
     /// The providers are asked in order, and the first font found is used.
@@ -1091,7 +943,6 @@ impl Fonts {
             let provided_fonts = core::mem::take(&mut self.fonts.provided_fonts);
 
             let mut fonts = FontsImpl::new(options, definitions, glyph_rasterizer.clone());
-            fonts.glyph_source_preference = Arc::clone(&self.fonts.glyph_source_preference);
             fonts.set_font_providers(font_providers.clone());
             fonts.install_provided_fonts(provided_fonts);
 
@@ -1346,7 +1197,6 @@ pub struct FontsImpl {
     raster_glyph_cache: IntMap<RasterGlyphCacheKey, Option<RasterGlyphAllocation>>,
     font_providers: Vec<Arc<dyn FontProvider>>,
     pub(crate) provided_fonts: ProvidedFonts,
-    glyph_source_preference: GlyphSourcePreference,
 }
 
 impl FontsImpl {
@@ -1388,7 +1238,6 @@ impl FontsImpl {
             raster_glyph_cache: Default::default(),
             font_providers: Vec::new(),
             provided_fonts: Default::default(),
-            glyph_source_preference: Arc::new(default_glyph_source),
         }
     }
 
@@ -1425,16 +1274,6 @@ impl FontsImpl {
         )
     }
 
-    /// Decide where to look first for the glyphs of each grapheme cluster.
-    ///
-    /// See [`GlyphSourcePreference`].
-    pub fn set_glyph_source_preference(
-        &mut self,
-        prefer: impl Fn(&str) -> GlyphSource + Send + Sync + 'static,
-    ) {
-        self.glyph_source_preference = Arc::new(prefer);
-    }
-
     pub fn options(&self) -> &TextOptions {
         self.atlas.options()
     }
@@ -1467,7 +1306,6 @@ impl FontsImpl {
                 .collect();
 
             // Fonts found by the providers come after the ones in the definitions:
-            let num_definition_fonts = fonts.len();
             for insert in &self.provided_fonts.inserts {
                 if insert.families.iter().any(|f| f.family == *family)
                     && let Some(key) = self.fonts_by_name.get(&insert.name)
@@ -1477,7 +1315,7 @@ impl FontsImpl {
                 }
             }
 
-            CachedFamily::new(fonts, num_definition_fonts, &mut self.fonts_by_id)
+            CachedFamily::new(fonts, &mut self.fonts_by_id)
         });
         Font {
             fonts_by_id: &mut self.fonts_by_id,
@@ -1487,7 +1325,6 @@ impl FontsImpl {
             family: family.clone(),
             glyph_rasterizer: self.glyph_rasterizer.as_ref(),
             raster_glyph_cache: &mut self.raster_glyph_cache,
-            glyph_source_preference: &self.glyph_source_preference,
             font_providers: &self.font_providers,
             provided_fonts: &mut self.provided_fonts,
         }
@@ -1957,62 +1794,6 @@ mod font_provider_tests {
 
         let glyph = first_glyph(&mut fonts, SCHWA);
         assert!(!glyph.is_color, "Should come from the provided font");
-        assert_eq!(requests.lock().len(), 1);
-    }
-
-    #[test]
-    #[cfg(feature = "monochrome_emoji_fonts")]
-    fn emoji_presentation_prefers_provided_fonts_over_definitions() {
-        // Hack and NotoEmoji from the definitions, emoji-icon-font from the provider.
-        // Both emoji fonts have 🚀.
-        let mut definitions = hack_only();
-        definitions.font_data.insert(
-            "NotoEmoji-Regular".to_owned(),
-            Arc::new(FontData::from_static(NOTO_EMOJI_REGULAR)),
-        );
-        definitions.families.insert(
-            FontFamily::Proportional,
-            vec!["Hack".to_owned(), "NotoEmoji-Regular".to_owned()],
-        );
-        let requests = Arc::new(Mutex::new(Vec::new()));
-        let provider = {
-            let requests = Arc::clone(&requests);
-            Arc::new(move |request: &FallbackRequest<'_>| {
-                requests.lock().push(request.cluster.to_owned());
-                Some(FontInsert::new(
-                    "provided:emoji-icon-font",
-                    FontData::from_static(EMOJI_ICON),
-                    vec![],
-                ))
-            })
-        };
-        let mut fonts = Fonts::new(TextOptions::default(), definitions, None)
-            .with_font_providers(vec![provider]);
-        let font_id = FontId::proportional(14.0);
-        let mut layout = |text: &str| {
-            let galley = fonts.with_pixels_per_point(1.0).layout_no_wrap(
-                text.to_owned(),
-                font_id.clone(),
-                Color32::WHITE,
-            );
-            galley.rows[0].row.glyphs[0].uv_rect
-        };
-
-        // Text presentation: NotoEmoji from the definitions wins, and the provider is not asked.
-        let text_presentation = layout("🚀\u{FE0E}");
-        assert!(requests.lock().is_empty());
-
-        // Emoji presentation: the provider is asked first, even though NotoEmoji has the glyph.
-        let emoji_presentation = layout("🚀");
-        assert_eq!(*requests.lock(), ["🚀"]);
-        assert_ne!(
-            emoji_presentation.min, text_presentation.min,
-            "Should be different glyphs, from different fonts"
-        );
-
-        // Both are cached:
-        layout("🚀\u{FE0E}");
-        layout("🚀");
         assert_eq!(requests.lock().len(), 1);
     }
 

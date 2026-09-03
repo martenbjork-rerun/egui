@@ -14,10 +14,7 @@ use crate::{
     text::{
         FallbackRequest, FontPriority, FontTweak, InsertFontFamily, MAX_GLYPH_SIZE,
         VariationCoords,
-        fonts::{
-            Blob, CachedFamily, FontFaceKey, FontProvider, GlyphSource, GlyphSourcePreference,
-            ProvidedFonts,
-        },
+        fonts::{Blob, CachedFamily, FontFaceKey, FontProvider, ProvidedFonts},
     },
 };
 
@@ -859,8 +856,6 @@ pub struct Font<'a> {
         &'a mut IntMap<RasterGlyphCacheKey, Option<RasterGlyphAllocation>>,
     pub(super) font_providers: &'a [std::sync::Arc<dyn FontProvider>],
     pub(super) provided_fonts: &'a mut ProvidedFonts,
-
-    pub(super) glyph_source_preference: &'a GlyphSourcePreference,
 }
 
 impl Font<'_> {
@@ -1002,64 +997,31 @@ impl Font<'_> {
     pub(crate) fn resolve_face(&mut self, c: char) -> FontFaceKey {
         let mut utf8 = [0_u8; 4];
         let cluster = c.encode_utf8(&mut utf8);
-        self.resolve_cluster_face(cluster, c, GlyphSource::Fonts)
+        self.resolve_cluster_face(cluster, c)
     }
 
     /// Like [`Self::resolve_face`] for the first char of `cluster`,
-    /// but lets the [`FontProvider`]s see the whole grapheme cluster,
-    /// and lets the caller pick where to look first.
-    ///
-    /// [`GlyphSource::Fonts`]: the fonts from [`crate::text::FontDefinitions`] first.
-    ///
-    /// [`GlyphSource::Platform`]: the fonts from the [`FontProvider`]s first,
-    /// so that e.g. a color emoji from the system beats a monochrome one from the definitions.
+    /// but lets the [`FontProvider`]s see the whole grapheme cluster.
     #[inline]
-    pub(crate) fn resolve_cluster_face(
-        &mut self,
-        cluster: &str,
-        base_char: char,
-        source: GlyphSource,
-    ) -> FontFaceKey {
-        if let Some(font_key) = self.cached_family.face_cache.get(&(source, base_char)) {
+    pub(crate) fn resolve_cluster_face(&mut self, cluster: &str, base_char: char) -> FontFaceKey {
+        if let Some(font_key) = self.cached_family.face_cache.get(&base_char) {
             return *font_key;
         }
-        self.resolve_face_slow(cluster, base_char, source)
+        self.resolve_face_slow(cluster, base_char)
     }
 
     #[cold]
-    fn resolve_face_slow(&mut self, cluster: &str, c: char, source: GlyphSource) -> FontFaceKey {
-        let font_key = match source {
-            GlyphSource::Fonts => self
-                // All the fonts, i.e. the ones from the definitions and then the provided ones…
-                .cached_family
-                .find_face_for_char(c, self.fonts_by_id)
-                // …and if none of them has the char, ask the providers for a new font:
-                .or_else(|| self.provided_face_for(cluster, c)),
-
-            GlyphSource::Platform => {
-                let num_definition_fonts = self.cached_family.num_definition_fonts;
-                // First the fonts we have already gotten from the providers…
-                CachedFamily::find_face_for_char_in(
-                    &self.cached_family.fonts[num_definition_fonts..],
-                    c,
-                    self.fonts_by_id,
-                )
-                // …then ask the providers for a new font, e.g. the system emoji font…
-                .or_else(|| self.provided_face_for(cluster, c))
-                // …and only then the fonts from the definitions,
-                // e.g. the bundled monochrome emoji font:
-                .or_else(|| {
-                    CachedFamily::find_face_for_char_in(
-                        &self.cached_family.fonts[..num_definition_fonts],
-                        c,
-                        self.fonts_by_id,
-                    )
-                })
-            }
-        }
-        // No font has the char, so we will render the replacement glyph (e.g. `◻`):
-        .unwrap_or(self.cached_family.replacement_face_key);
-        self.cached_family.face_cache.insert((source, c), font_key);
+    fn resolve_face_slow(&mut self, cluster: &str, c: char) -> FontFaceKey {
+        let font_key = self
+            // All the installed fonts, i.e. the ones from the definitions
+            // and then the ones we have already gotten from the providers…
+            .cached_family
+            .find_face_for_char(c, self.fonts_by_id)
+            // …and if none of them has the char, ask the providers for a new font:
+            .or_else(|| self.provided_face_for(cluster, c))
+            // No font has the char, so we will render the replacement glyph (e.g. `◻`):
+            .unwrap_or(self.cached_family.replacement_face_key);
+        self.cached_family.face_cache.insert(c, font_key);
         font_key
     }
 
