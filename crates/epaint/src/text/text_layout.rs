@@ -1698,6 +1698,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "monochrome_emoji_fonts")] // Needs ⏮ from `emoji-icon-font`
     fn preferred_clusters_use_rasterizer_before_fonts() {
         let requests = Arc::new(crate::mutex::Mutex::new(Vec::new()));
         let rasterizer = recording_rasterizer(&requests, Some(color_raster_glyph()));
@@ -1781,6 +1782,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "monochrome_emoji_fonts")] // Needs ⏮ from `emoji-icon-font`
     fn custom_prefer_predicate() {
         let requests = Arc::new(crate::mutex::Mutex::new(Vec::new()));
         let rasterizer = recording_rasterizer(&requests, Some(color_raster_glyph()));
@@ -1931,6 +1933,9 @@ mod tests {
     }
 
     #[test]
+    // No bundled font has CJK glyphs, so the line breaks depend on the width of the
+    // replacement glyph, and that depends on which fonts are bundled.
+    #[cfg(feature = "monochrome_emoji_fonts")]
     fn test_cjk() {
         let pixels_per_point = 1.0;
         let mut fonts = test_fonts();
@@ -1947,6 +1952,9 @@ mod tests {
     }
 
     #[test]
+    // No bundled font has CJK glyphs, so the line breaks depend on the width of the
+    // replacement glyph, and that depends on which fonts are bundled.
+    #[cfg(feature = "monochrome_emoji_fonts")]
     fn test_pre_cjk() {
         let pixels_per_point = 1.0;
         let mut fonts = test_fonts();
