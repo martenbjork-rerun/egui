@@ -9,6 +9,7 @@ use crate::{
     },
 };
 use emath::{NumExt as _, OrderedFloat, Rangef};
+use nohash_hasher::IntMap;
 
 #[cfg(feature = "default_fonts")]
 use epaint_default_fonts::{EMOJI_ICON, HACK_REGULAR, NOTO_EMOJI_REGULAR, UBUNTU_LIGHT};
@@ -924,7 +925,7 @@ impl CachedFamily {
     fn new(
         fonts: Vec<FontFaceKey>,
         num_definition_fonts: usize,
-        fonts_by_id: &mut nohash_hasher::IntMap<FontFaceKey, FontFace>,
+        fonts_by_id: &mut IntMap<FontFaceKey, FontFace>,
     ) -> Self {
         const PRIMARY_REPLACEMENT_CHAR: char = '◻'; // white medium square
         const FALLBACK_REPLACEMENT_CHAR: char = '?'; // fallback for the fallback
@@ -975,7 +976,7 @@ impl CachedFamily {
     pub(crate) fn find_face_for_char(
         &self,
         c: char,
-        fonts_by_id: &mut nohash_hasher::IntMap<FontFaceKey, FontFace>,
+        fonts_by_id: &mut IntMap<FontFaceKey, FontFace>,
     ) -> Option<FontFaceKey> {
         Self::find_face_for_char_in(&self.fonts, c, fonts_by_id)
     }
@@ -984,7 +985,7 @@ impl CachedFamily {
     pub(crate) fn find_face_for_char_in(
         fonts: &[FontFaceKey],
         c: char,
-        fonts_by_id: &mut nohash_hasher::IntMap<FontFaceKey, FontFace>,
+        fonts_by_id: &mut IntMap<FontFaceKey, FontFace>,
     ) -> Option<FontFaceKey> {
         for font_key in fonts {
             let font_face = fonts_by_id.get_mut(font_key).expect("Nonexistent font ID");
@@ -1323,14 +1324,14 @@ impl FontsView<'_> {
 pub struct FontsImpl {
     definitions: FontDefinitions,
     atlas: TextureAtlas,
-    fonts_by_id: nohash_hasher::IntMap<FontFaceKey, FontFace>,
+    fonts_by_id: IntMap<FontFaceKey, FontFace>,
     fonts_by_name: ahash::HashMap<String, FontFaceKey>,
     family_cache: ahash::HashMap<FontFamily, CachedFamily>,
 
     /// Recycled `harfrust` shaping buffer to avoid per-layout allocations.
     shape_buffer: Option<harfrust::UnicodeBuffer>,
     glyph_rasterizer: Option<GlyphRasterizer>,
-    raster_glyph_cache: nohash_hasher::IntMap<RasterGlyphCacheKey, Option<RasterGlyphAllocation>>,
+    raster_glyph_cache: IntMap<RasterGlyphCacheKey, Option<RasterGlyphAllocation>>,
     font_providers: Vec<Arc<dyn FontProvider>>,
     pub(crate) provided_fonts: ProvidedFonts,
     glyph_source_preference: GlyphSourcePreference,
@@ -1348,7 +1349,7 @@ impl FontsImpl {
         let initial_height = 32; // Keep initial font atlas small, so it is fast to upload to GPU. This will expand as needed anyways.
         let atlas = TextureAtlas::new([texture_width, initial_height], options);
 
-        let mut fonts_by_id: nohash_hasher::IntMap<FontFaceKey, FontFace> = Default::default();
+        let mut fonts_by_id: IntMap<FontFaceKey, FontFace> = Default::default();
         let mut fonts_by_name: ahash::HashMap<String, FontFaceKey> = Default::default();
         for (name, font_data) in &definitions.font_data {
             let font_face = FontFace::new(
@@ -1486,7 +1487,7 @@ impl FontsImpl {
 /// Returns `None` if the font fails to parse.
 pub(crate) fn install_font_face(
     options: TextOptions,
-    fonts_by_id: &mut nohash_hasher::IntMap<FontFaceKey, FontFace>,
+    fonts_by_id: &mut IntMap<FontFaceKey, FontFace>,
     fonts_by_name: &mut ahash::HashMap<String, FontFaceKey>,
     insert: &FontInsert,
 ) -> Option<FontFaceKey> {
@@ -1532,7 +1533,7 @@ struct CachedGalley {
 struct GalleyCache {
     /// Frame counter used to do garbage collection on the cache
     generation: u32,
-    cache: nohash_hasher::IntMap<u64, CachedGalley>,
+    cache: IntMap<u64, CachedGalley>,
 }
 
 impl GalleyCache {

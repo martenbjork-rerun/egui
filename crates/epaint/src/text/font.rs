@@ -3,6 +3,7 @@
 use ahash::HashMap;
 use ecolor::Color32;
 use emath::{GuiRounding as _, OrderedFloat, Vec2, vec2};
+use nohash_hasher::IntMap;
 use self_cell::self_cell;
 use skrifa::{GlyphId, MetadataProvider as _};
 use std::collections::BTreeMap;
@@ -846,7 +847,7 @@ pub(crate) struct ShapedGlyph {
 // TODO(emilk): rename?
 /// Wrapper over multiple [`FontFace`] (e.g. a primary + fallbacks for emojis)
 pub struct Font<'a> {
-    pub(super) fonts_by_id: &'a mut nohash_hasher::IntMap<FontFaceKey, FontFace>,
+    pub(super) fonts_by_id: &'a mut IntMap<FontFaceKey, FontFace>,
     pub(super) fonts_by_name: &'a mut HashMap<String, FontFaceKey>,
     pub(super) cached_family: &'a mut CachedFamily,
     pub(super) atlas: &'a mut TextureAtlas,
@@ -855,7 +856,7 @@ pub struct Font<'a> {
 
     /// `None` means the rasterizer could not handle the cluster.
     pub(super) raster_glyph_cache:
-        &'a mut nohash_hasher::IntMap<RasterGlyphCacheKey, Option<RasterGlyphAllocation>>,
+        &'a mut IntMap<RasterGlyphCacheKey, Option<RasterGlyphAllocation>>,
     pub(super) font_providers: &'a [std::sync::Arc<dyn FontProvider>],
     pub(super) provided_fonts: &'a mut ProvidedFonts,
 
