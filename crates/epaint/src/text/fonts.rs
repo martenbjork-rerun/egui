@@ -216,6 +216,64 @@ mod has_emoji_presentation_tests {
     }
 }
 
+/// Input to a [`FontProvider`].
+pub struct FallbackRequest<'a> {
+    /// A grapheme cluster that no installed font can render.
+    pub cluster: &'a str,
+
+    /// The first character of [`Self::cluster`].
+    ///
+    /// The returned font must have a glyph for it.
+    pub base_char: char,
+
+    /// The requested font family.
+    pub family: &'a FontFamily,
+}
+
+/// Finds a font file for text that no installed font covers, e.g. among the system fonts.
+///
+/// The returned font is appended to the fallback chain of the requested family,
+/// after the fonts in [`FontDefinitions`], and is then used like any other font:
+/// shaped, hinted, and kerned.
+///
+/// Install one with `egui::Context::add_font_provider` or [`Fonts::with_font_providers`].
+/// `eframe` installs one on native (behind its `system_fonts` feature).
+///
+/// Any `Fn(&FallbackRequest<'_>) -> Option<FontInsert>` is a [`FontProvider`].
+pub trait FontProvider: Send + Sync {
+    /// Find a font with a glyph for `request.base_char`.
+    ///
+    /// Called at most once per (family, character), also when returning `None`,
+    /// until the [`FontDefinitions`] change.
+    ///
+    /// The font is appended to the fallback chain of `request.family`
+    /// and of the families in [`FontInsert::families`].
+    /// The [`FontPriority`] is ignored: provided fonts always come after the fonts in [`FontDefinitions`].
+    fn font_for(&self, request: &FallbackRequest<'_>) -> Option<FontInsert>;
+}
+
+impl<F> FontProvider for F
+where
+    F: Fn(&FallbackRequest<'_>) -> Option<FontInsert> + Send + Sync,
+{
+    fn font_for(&self, request: &FallbackRequest<'_>) -> Option<FontInsert> {
+        self(request)
+    }
+}
+
+/// Fonts found by [`FontProvider`]s.
+///
+/// Kept when [`Fonts::begin_pass`] rebuilds the [`FontsImpl`],
+/// so the providers are asked at most once per character.
+#[derive(Debug, Default)]
+pub(crate) struct ProvidedFonts {
+    /// In the order they were found.
+    pub inserts: Vec<FontInsert>,
+
+    /// No provider had a font for these.
+    pub misses: ahash::HashSet<(FontFamily, char)>,
+}
+
 impl Default for FontId {
     #[inline]
     fn default() -> Self {
@@ -939,6 +997,7 @@ pub struct Fonts {
     pub fonts: FontsImpl,
     galley_cache: GalleyCache,
     glyph_rasterizer: Option<GlyphRasterizer>,
+    font_providers: Vec<Arc<dyn FontProvider>>,
 }
 
 impl Fonts {
@@ -954,6 +1013,7 @@ impl Fonts {
             fonts: FontsImpl::new(options, definitions, glyph_rasterizer.clone()),
             galley_cache: Default::default(),
             glyph_rasterizer,
+            font_providers: Vec::new(),
         }
     }
 
@@ -967,6 +1027,22 @@ impl Fonts {
     ) -> Self {
         self.fonts.set_glyph_source_preference(prefer);
         self
+    }
+
+    /// Ask these for fonts for characters that no font in the [`FontDefinitions`] has.
+    ///
+    /// The providers are asked in order, and the first font found is used.
+    pub fn with_font_providers(mut self, font_providers: Vec<Arc<dyn FontProvider>>) -> Self {
+        self.fonts.set_font_providers(font_providers.clone());
+        self.font_providers = font_providers;
+        self
+    }
+
+    /// The fonts found by the [`FontProvider`]s so far, in the order they were found.
+    ///
+    /// These are not part of [`Self::definitions`].
+    pub fn provided_fonts(&self) -> &[FontInsert] {
+        &self.fonts.provided_fonts.inserts
     }
 
     /// Call at the start of each frame with the latest known [`TextOptions`].
@@ -983,14 +1059,19 @@ impl Fonts {
         if needs_recreate {
             let definitions = self.fonts.definitions.clone();
             let glyph_rasterizer = self.glyph_rasterizer.clone();
+            let font_providers = core::mem::take(&mut self.font_providers);
+            let provided_fonts = core::mem::take(&mut self.fonts.provided_fonts);
 
             let mut fonts = FontsImpl::new(options, definitions, glyph_rasterizer.clone());
             fonts.glyph_source_preference = Arc::clone(&self.fonts.glyph_source_preference);
+            fonts.set_font_providers(font_providers.clone());
+            fonts.install_provided_fonts(provided_fonts);
 
             *self = Self {
                 fonts,
                 galley_cache: Default::default(),
                 glyph_rasterizer,
+                font_providers,
             };
         }
 
@@ -1228,6 +1309,8 @@ pub struct FontsImpl {
     shape_buffer: Option<harfrust::UnicodeBuffer>,
     glyph_rasterizer: Option<GlyphRasterizer>,
     raster_glyph_cache: nohash_hasher::IntMap<RasterGlyphCacheKey, Option<RasterGlyphAllocation>>,
+    font_providers: Vec<Arc<dyn FontProvider>>,
+    pub(crate) provided_fonts: ProvidedFonts,
     glyph_source_preference: GlyphSourcePreference,
 }
 
@@ -1268,8 +1351,43 @@ impl FontsImpl {
             shape_buffer: Some(harfrust::UnicodeBuffer::new()),
             glyph_rasterizer,
             raster_glyph_cache: Default::default(),
+            font_providers: Vec::new(),
+            provided_fonts: Default::default(),
             glyph_source_preference: Arc::new(default_glyph_source),
         }
+    }
+
+    /// Ask these for fonts for characters that no font in the [`FontDefinitions`] has.
+    ///
+    /// The providers are asked in order, and the first font found is used.
+    pub fn set_font_providers(&mut self, font_providers: Vec<Arc<dyn FontProvider>>) {
+        self.font_providers = font_providers;
+    }
+
+    /// Install the fonts found by the providers of a previous [`FontsImpl`].
+    ///
+    /// Must be called before any call to [`Self::font`].
+    fn install_provided_fonts(&mut self, provided_fonts: ProvidedFonts) {
+        debug_assert!(
+            self.family_cache.is_empty(),
+            "Provided fonts must be installed before any family is cached"
+        );
+        for insert in &provided_fonts.inserts {
+            self.font_face_key_for_insert(insert);
+        }
+        self.provided_fonts = provided_fonts;
+    }
+
+    /// Parse the font of a [`FontInsert`] into a [`FontFace`], unless a font with the same name is already installed.
+    ///
+    /// Returns `None` if the font fails to parse.
+    fn font_face_key_for_insert(&mut self, insert: &FontInsert) -> Option<FontFaceKey> {
+        install_font_face(
+            *self.atlas.options(),
+            &mut self.fonts_by_id,
+            &mut self.fonts_by_name,
+            insert,
+        )
     }
 
     /// Decide where to look first for the glyphs of each grapheme cluster.
@@ -1303,7 +1421,7 @@ impl FontsImpl {
             let fonts =
                 fonts.unwrap_or_else(|| panic!("FontFamily::{family:?} is not bound to any fonts"));
 
-            let fonts: Vec<FontFaceKey> = fonts
+            let mut fonts: Vec<FontFaceKey> = fonts
                 .iter()
                 .map(|font_name| {
                     *self
@@ -1313,16 +1431,62 @@ impl FontsImpl {
                 })
                 .collect();
 
+            // Fonts found by the providers come after the ones in the definitions:
+            for insert in &self.provided_fonts.inserts {
+                if insert.families.iter().any(|f| f.family == *family)
+                    && let Some(key) = self.fonts_by_name.get(&insert.name)
+                    && !fonts.contains(key)
+                {
+                    fonts.push(*key);
+                }
+            }
+
             CachedFamily::new(fonts, &mut self.fonts_by_id)
         });
         Font {
             fonts_by_id: &mut self.fonts_by_id,
+            fonts_by_name: &mut self.fonts_by_name,
             cached_family,
             atlas: &mut self.atlas,
             family: family.clone(),
             glyph_rasterizer: self.glyph_rasterizer.as_ref(),
             raster_glyph_cache: &mut self.raster_glyph_cache,
             glyph_source_preference: &self.glyph_source_preference,
+            font_providers: &self.font_providers,
+            provided_fonts: &mut self.provided_fonts,
+        }
+    }
+}
+
+/// Parse the font of a [`FontInsert`] into a [`FontFace`], unless a font with the same name is already installed.
+///
+/// Returns `None` if the font fails to parse.
+pub(crate) fn install_font_face(
+    options: TextOptions,
+    fonts_by_id: &mut nohash_hasher::IntMap<FontFaceKey, FontFace>,
+    fonts_by_name: &mut ahash::HashMap<String, FontFaceKey>,
+    insert: &FontInsert,
+) -> Option<FontFaceKey> {
+    if let Some(key) = fonts_by_name.get(&insert.name) {
+        return Some(*key);
+    }
+    let FontInsert { name, data, .. } = insert;
+    match FontFace::new(
+        options,
+        name.clone(),
+        Arc::clone(&data.font),
+        data.index,
+        data.tweak.clone(),
+    ) {
+        Ok(font_face) => {
+            let key = FontFaceKey::new();
+            fonts_by_id.insert(key, font_face);
+            fonts_by_name.insert(name.clone(), key);
+            Some(key)
+        }
+        Err(err) => {
+            log::warn!("Failed to parse font {name:?}: {err}");
+            None
         }
     }
 }
@@ -1582,6 +1746,189 @@ fn should_cache_each_paragraph_individually(job: &LayoutJob) -> bool {
     // Most often, elided text is elided to one row,
     // and so will always be fast to lay out.
     job.break_on_newline && job.wrap.max_rows == usize::MAX && job.text.contains('\n')
+}
+
+#[cfg(feature = "default_fonts")]
+#[cfg(test)]
+mod font_provider_tests {
+    use super::*;
+    use crate::{ColorImage, mutex::Mutex};
+
+    const EMOJI: char = '😀'; // In NotoEmoji, but not in Hack.
+    const HANGUL: char = '한'; // In neither.
+
+    /// Only Hack, so that emoji are missing.
+    fn hack_only() -> FontDefinitions {
+        let mut definitions = FontDefinitions::empty();
+        definitions.font_data.insert(
+            "Hack".to_owned(),
+            Arc::new(FontData::from_static(HACK_REGULAR)),
+        );
+        definitions
+            .families
+            .insert(FontFamily::Proportional, vec!["Hack".to_owned()]);
+        definitions
+            .families
+            .insert(FontFamily::Monospace, vec!["Hack".to_owned()]);
+        definitions
+    }
+
+    /// A provider that records its requests, and returns `NotoEmoji` for everything if `provide`.
+    fn recording_provider(
+        requests: &Arc<Mutex<Vec<(FontFamily, char)>>>,
+        provide: bool,
+    ) -> Arc<dyn FontProvider> {
+        let requests = Arc::clone(requests);
+        Arc::new(move |request: &FallbackRequest<'_>| {
+            requests
+                .lock()
+                .push((request.family.clone(), request.base_char));
+            provide.then(|| {
+                FontInsert::new(
+                    "provided:NotoEmoji",
+                    FontData::from_static(NOTO_EMOJI_REGULAR),
+                    vec![InsertFontFamily {
+                        family: request.family.clone(),
+                        priority: FontPriority::Lowest,
+                    }],
+                )
+            })
+        })
+    }
+
+    fn color_rasterizer() -> GlyphRasterizer {
+        GlyphRasterizer::new(|_: &GlyphRasterizerRequest<'_>| {
+            Some(RasterizedGlyph {
+                image: ColorImage::new([1, 1], vec![Color32::RED]),
+                offset_px: emath::Vec2::ZERO,
+                advance_px: 10.0,
+                is_color: true,
+            })
+        })
+    }
+
+    fn fonts_with(provider: Arc<dyn FontProvider>, rasterizer: Option<GlyphRasterizer>) -> Fonts {
+        Fonts::new(TextOptions::default(), hack_only(), rasterizer)
+            .with_font_providers(vec![provider])
+    }
+
+    fn first_glyph(fonts: &mut Fonts, c: char) -> crate::text::Glyph {
+        let galley = fonts.with_pixels_per_point(1.0).layout_no_wrap(
+            c.to_string(),
+            FontId::proportional(14.0),
+            Color32::WHITE,
+        );
+        galley.rows[0].row.glyphs[0]
+    }
+
+    #[test]
+    fn provider_hit_installs_the_font_once() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let mut fonts = fonts_with(recording_provider(&requests, true), None);
+        let font_id = FontId::proportional(14.0);
+
+        assert!(fonts.has_glyph(&font_id, EMOJI));
+        assert!(fonts.has_glyph(&font_id, EMOJI));
+        assert!(fonts.has_glyph(&font_id, 'a'));
+        assert_eq!(*requests.lock(), vec![(FontFamily::Proportional, EMOJI)]);
+        assert_eq!(fonts.provided_fonts().len(), 1);
+
+        let glyph = first_glyph(&mut fonts, EMOJI);
+        assert!(!glyph.uv_rect.is_nothing());
+        assert!(!glyph.is_color);
+        assert_eq!(requests.lock().len(), 1);
+
+        let mut font = fonts.fonts.font(&FontFamily::Proportional);
+        assert_eq!(
+            font.characters().get(&EMOJI),
+            Some(&vec!["provided:NotoEmoji".to_owned()])
+        );
+    }
+
+    #[test]
+    fn provider_miss_is_remembered_per_family() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let mut fonts = fonts_with(recording_provider(&requests, false), None);
+
+        assert!(!fonts.has_glyph(&FontId::proportional(14.0), HANGUL));
+        assert!(!fonts.has_glyph(&FontId::proportional(14.0), HANGUL));
+        assert!(!fonts.has_glyph(&FontId::monospace(14.0), HANGUL));
+        assert_eq!(
+            *requests.lock(),
+            vec![
+                (FontFamily::Proportional, HANGUL),
+                (FontFamily::Monospace, HANGUL),
+            ]
+        );
+        assert!(fonts.provided_fonts().is_empty());
+    }
+
+    #[test]
+    fn provider_is_not_asked_for_control_chars_and_combining_marks() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let mut fonts = fonts_with(recording_provider(&requests, true), None);
+        let font_id = FontId::proportional(14.0);
+
+        fonts.has_glyph(&font_id, '\n');
+        fonts.has_glyph(&font_id, '\u{1AB0}'); // COMBINING DOUBLED CIRCUMFLEX ACCENT
+        assert!(requests.lock().is_empty());
+    }
+
+    #[test]
+    fn provided_fonts_and_misses_survive_a_rebuild() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let mut fonts = fonts_with(recording_provider(&requests, true), None);
+        let font_id = FontId::proportional(14.0);
+
+        assert!(fonts.has_glyph(&font_id, EMOJI));
+        // The provider returns NotoEmoji for this too, but it has no glyph for it:
+        assert!(!fonts.has_glyph(&font_id, HANGUL));
+        assert_eq!(requests.lock().len(), 2);
+        assert_eq!(fonts.provided_fonts().len(), 1);
+
+        // Force a rebuild by changing the text options:
+        let options = TextOptions {
+            font_hinting: !TextOptions::default().font_hinting,
+            ..Default::default()
+        };
+        fonts.begin_pass(options);
+
+        assert!(fonts.has_glyph(&font_id, EMOJI));
+        assert!(!fonts.has_glyph(&font_id, HANGUL));
+        assert_eq!(
+            requests.lock().len(),
+            2,
+            "The provider should not be asked again"
+        );
+        assert_eq!(fonts.provided_fonts().len(), 1);
+    }
+
+    #[test]
+    fn provided_font_beats_the_rasterizer() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let mut fonts = fonts_with(
+            recording_provider(&requests, true),
+            Some(color_rasterizer()),
+        )
+        .with_glyph_source_preference(|_| GlyphSource::Fonts);
+
+        let glyph = first_glyph(&mut fonts, EMOJI);
+        assert!(!glyph.is_color, "Should come from the provided font");
+        assert_eq!(requests.lock().len(), 1);
+    }
+
+    #[test]
+    fn rasterizer_is_used_when_the_provider_misses() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let mut fonts = fonts_with(
+            recording_provider(&requests, false),
+            Some(color_rasterizer()),
+        );
+
+        let glyph = first_glyph(&mut fonts, HANGUL);
+        assert!(glyph.is_color, "Should come from the rasterizer");
+        assert_eq!(requests.lock().len(), 1);
+    }
 }
 
 #[cfg(feature = "default_fonts")]

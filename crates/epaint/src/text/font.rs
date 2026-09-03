@@ -11,8 +11,11 @@ use vello_cpu::{color, kurbo};
 use crate::{
     TextOptions, TextureAtlas,
     text::{
-        FontTweak, MAX_GLYPH_SIZE, VariationCoords,
-        fonts::{Blob, CachedFamily, FontFaceKey, GlyphSourcePreference},
+        FallbackRequest, FontPriority, FontTweak, InsertFontFamily, MAX_GLYPH_SIZE,
+        VariationCoords,
+        fonts::{
+            Blob, CachedFamily, FontFaceKey, FontProvider, GlyphSourcePreference, ProvidedFonts,
+        },
     },
 };
 
@@ -694,6 +697,7 @@ pub(crate) struct ShapedGlyph {
 /// Wrapper over multiple [`FontFace`] (e.g. a primary + fallbacks for emojis)
 pub struct Font<'a> {
     pub(super) fonts_by_id: &'a mut nohash_hasher::IntMap<FontFaceKey, FontFace>,
+    pub(super) fonts_by_name: &'a mut HashMap<String, FontFaceKey>,
     pub(super) cached_family: &'a mut CachedFamily,
     pub(super) atlas: &'a mut TextureAtlas,
     pub(super) family: crate::text::FontFamily,
@@ -702,6 +706,8 @@ pub struct Font<'a> {
     /// `None` means the rasterizer could not handle the cluster.
     pub(super) raster_glyph_cache:
         &'a mut nohash_hasher::IntMap<RasterGlyphCacheKey, Option<RasterGlyphAllocation>>,
+    pub(super) font_providers: &'a [std::sync::Arc<dyn FontProvider>],
+    pub(super) provided_fonts: &'a mut ProvidedFonts,
 
     pub(super) glyph_source_preference: &'a GlyphSourcePreference,
 }
@@ -823,8 +829,10 @@ impl Font<'_> {
     /// This does not consult the [`crate::text::GlyphRasterizer`], so it can return `false`
     /// for a character that would still render via the rasterizer (e.g. the browser on web).
     pub fn has_glyph(&mut self, c: char) -> bool {
-        // TODO(emilk): this is a false negative if the user asks about the replacement character itself 🤦‍♂️
-        self.resolve_face(c) != self.cached_family.replacement_face_key
+        let face_key = self.resolve_face(c);
+        self.fonts_by_id
+            .get_mut(&face_key)
+            .is_some_and(|face| face.glyph_id_resolution(c).is_some())
     }
 
     /// Do the installed fonts have all the glyphs in this text?
@@ -837,23 +845,102 @@ impl Font<'_> {
     /// Find which face in the fallback chain owns `c`.
     ///
     /// Location-independent — fallback choice depends only on charmap support.
-    /// Falls back to the replacement-glyph face when no fallback face has `c`.
+    /// Asks the [`FontProvider`]s when no face has `c`,
+    /// and falls back to the replacement-glyph face when they have no font for it either.
     #[inline]
     pub(crate) fn resolve_face(&mut self, c: char) -> FontFaceKey {
         if let Some(font_key) = self.cached_family.face_cache.get(&c) {
             return *font_key;
         }
-        self.resolve_face_slow(c)
+        let mut utf8 = [0_u8; 4];
+        let cluster = c.encode_utf8(&mut utf8);
+        self.resolve_face_slow(cluster, c)
+    }
+
+    /// Like [`Self::resolve_face`] for the first char of `cluster`,
+    /// but lets the [`FontProvider`]s see the whole grapheme cluster.
+    #[inline]
+    pub(crate) fn resolve_cluster_face(&mut self, cluster: &str, base_char: char) -> FontFaceKey {
+        if let Some(font_key) = self.cached_family.face_cache.get(&base_char) {
+            return *font_key;
+        }
+        self.resolve_face_slow(cluster, base_char)
     }
 
     #[cold]
-    fn resolve_face_slow(&mut self, c: char) -> FontFaceKey {
+    fn resolve_face_slow(&mut self, cluster: &str, c: char) -> FontFaceKey {
         let font_key = self
             .cached_family
             .find_face_for_char(c, self.fonts_by_id)
+            .or_else(|| self.provided_face_for(cluster, c))
             .unwrap_or(self.cached_family.replacement_face_key);
         self.cached_family.face_cache.insert(c, font_key);
         font_key
+    }
+
+    /// Ask the [`FontProvider`]s for a font with a glyph for `base_char`, and install it.
+    ///
+    /// Misses are remembered, so each provider is asked at most once per (family, char).
+    fn provided_face_for(&mut self, cluster: &str, base_char: char) -> Option<FontFaceKey> {
+        if self.font_providers.is_empty()
+            || base_char.is_control()
+            || is_combining_mark(base_char)
+            || self
+                .provided_fonts
+                .misses
+                .contains(&(self.family.clone(), base_char))
+        {
+            return None;
+        }
+
+        let request = FallbackRequest {
+            cluster,
+            base_char,
+            family: &self.family,
+        };
+
+        for provider in self.font_providers {
+            let Some(mut insert) = provider.font_for(&request) else {
+                continue;
+            };
+            let Some(key) = crate::text::fonts::install_font_face(
+                *self.atlas.options(),
+                self.fonts_by_id,
+                self.fonts_by_name,
+                &insert,
+            ) else {
+                continue;
+            };
+            let has_glyph = self
+                .fonts_by_id
+                .get_mut(&key)
+                .is_some_and(|face| face.glyph_id_resolution(base_char).is_some());
+            if !has_glyph {
+                log::warn!(
+                    "Font {:?} from a font provider has no glyph for {base_char:?}",
+                    insert.name
+                );
+                continue;
+            }
+
+            if !insert.families.iter().any(|f| f.family == self.family) {
+                insert.families.push(InsertFontFamily {
+                    family: self.family.clone(),
+                    priority: FontPriority::Lowest,
+                });
+            }
+            if !self.cached_family.fonts.contains(&key) {
+                self.cached_family.fonts.push(key);
+                self.cached_family.characters = None;
+            }
+            self.provided_fonts.inserts.push(insert);
+            return Some(key);
+        }
+
+        self.provided_fonts
+            .misses
+            .insert((self.family.clone(), base_char));
+        None
     }
 
     /// Resolve `c` to its (face, [`GlyphInfo`]) at the given face's location.
@@ -964,6 +1051,21 @@ fn invisible_char(c: char) -> bool {
             | '\u{206E}' // NATIONAL DIGIT SHAPES
             | '\u{206F}' // NOMINAL DIGIT SHAPES
             | '\u{FEFF}' // ZERO WIDTH NO-BREAK SPACE
+    )
+}
+
+/// Is the character a Unicode combining mark (categories Mn, Mc, Me)?
+///
+/// These characters modify the preceding base character and should not be
+/// rendered as standalone replacement glyphs when the shaper can't handle them.
+#[inline]
+pub(super) fn is_combining_mark(c: char) -> bool {
+    use unicode_general_category::{GeneralCategory, get_general_category};
+    matches!(
+        get_general_category(c),
+        GeneralCategory::NonspacingMark
+            | GeneralCategory::SpacingMark
+            | GeneralCategory::EnclosingMark
     )
 }
 

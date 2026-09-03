@@ -9,10 +9,11 @@ mod text_layout_types;
 
 pub use {
     fonts::{
-        Blob, FontData, FontDefinitions, FontFamily, FontId, FontInsert, FontPriority, FontTweak,
-        FontVariationAxis, Fonts, FontsImpl, FontsView, GlyphRasterizer, GlyphRasterizerRequest,
-        GlyphSource, GlyphSourcePreference, HintingTarget, InsertFontFamily, MAX_GLYPH_SIZE,
-        RasterizedGlyph, SmoothHinting, default_glyph_source, has_emoji_presentation,
+        Blob, FallbackRequest, FontData, FontDefinitions, FontFamily, FontId, FontInsert,
+        FontPriority, FontProvider, FontTweak, FontVariationAxis, Fonts, FontsImpl, FontsView,
+        GlyphRasterizer, GlyphRasterizerRequest, GlyphSource, GlyphSourcePreference, HintingTarget,
+        InsertFontFamily, MAX_GLYPH_SIZE, RasterizedGlyph, SmoothHinting, default_glyph_source,
+        has_emoji_presentation,
     },
     index::{ByteIndex, ByteRange, ByteRangeExt, CharIndex, CharRange, CharRangeExt},
     text_layout::*,
