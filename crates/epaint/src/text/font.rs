@@ -14,7 +14,8 @@ use crate::{
         FallbackRequest, FontPriority, FontTweak, InsertFontFamily, MAX_GLYPH_SIZE,
         VariationCoords,
         fonts::{
-            Blob, CachedFamily, FontFaceKey, FontProvider, GlyphSourcePreference, ProvidedFonts,
+            Blob, CachedFamily, FontFaceKey, FontProvider, GlyphSource, GlyphSourcePreference,
+            ProvidedFonts,
         },
     },
 };
@@ -998,32 +999,57 @@ impl Font<'_> {
     /// and falls back to the replacement-glyph face when they have no font for it either.
     #[inline]
     pub(crate) fn resolve_face(&mut self, c: char) -> FontFaceKey {
-        if let Some(font_key) = self.cached_family.face_cache.get(&c) {
-            return *font_key;
-        }
         let mut utf8 = [0_u8; 4];
         let cluster = c.encode_utf8(&mut utf8);
-        self.resolve_face_slow(cluster, c)
+        self.resolve_cluster_face(cluster, c, GlyphSource::Fonts)
     }
 
     /// Like [`Self::resolve_face`] for the first char of `cluster`,
-    /// but lets the [`FontProvider`]s see the whole grapheme cluster.
+    /// but lets the [`FontProvider`]s see the whole grapheme cluster,
+    /// and lets the caller pick where to look first.
+    ///
+    /// [`GlyphSource::Fonts`]: the fonts in the definitions, then the provided fonts and providers.
+    ///
+    /// [`GlyphSource::Platform`]: the provided fonts and providers, then the fonts in the definitions.
     #[inline]
-    pub(crate) fn resolve_cluster_face(&mut self, cluster: &str, base_char: char) -> FontFaceKey {
-        if let Some(font_key) = self.cached_family.face_cache.get(&base_char) {
+    pub(crate) fn resolve_cluster_face(
+        &mut self,
+        cluster: &str,
+        base_char: char,
+        source: GlyphSource,
+    ) -> FontFaceKey {
+        if let Some(font_key) = self.cached_family.face_cache.get(&(source, base_char)) {
             return *font_key;
         }
-        self.resolve_face_slow(cluster, base_char)
+        self.resolve_face_slow(cluster, base_char, source)
     }
 
     #[cold]
-    fn resolve_face_slow(&mut self, cluster: &str, c: char) -> FontFaceKey {
-        let font_key = self
-            .cached_family
-            .find_face_for_char(c, self.fonts_by_id)
-            .or_else(|| self.provided_face_for(cluster, c))
-            .unwrap_or(self.cached_family.replacement_face_key);
-        self.cached_family.face_cache.insert(c, font_key);
+    fn resolve_face_slow(&mut self, cluster: &str, c: char, source: GlyphSource) -> FontFaceKey {
+        let font_key = match source {
+            GlyphSource::Fonts => self
+                .cached_family
+                .find_face_for_char(c, self.fonts_by_id)
+                .or_else(|| self.provided_face_for(cluster, c)),
+            GlyphSource::Platform => {
+                let num_definition_fonts = self.cached_family.num_definition_fonts;
+                CachedFamily::find_face_for_char_in(
+                    &self.cached_family.fonts[num_definition_fonts..],
+                    c,
+                    self.fonts_by_id,
+                )
+                .or_else(|| self.provided_face_for(cluster, c))
+                .or_else(|| {
+                    CachedFamily::find_face_for_char_in(
+                        &self.cached_family.fonts[..num_definition_fonts],
+                        c,
+                        self.fonts_by_id,
+                    )
+                })
+            }
+        }
+        .unwrap_or(self.cached_family.replacement_face_key);
+        self.cached_family.face_cache.insert((source, c), font_key);
         font_key
     }
 

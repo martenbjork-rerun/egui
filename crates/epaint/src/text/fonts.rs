@@ -895,7 +895,11 @@ impl nohash_hasher::IsEnabled for FontFaceKey {}
 /// Cached data for working with a font family (e.g. doing character lookups).
 #[derive(Debug)]
 pub(super) struct CachedFamily {
+    /// The fonts from the [`FontDefinitions`] first, then the ones found by the [`FontProvider`]s.
     pub fonts: Vec<FontFaceKey>,
+
+    /// How many of [`Self::fonts`] come from the [`FontDefinitions`].
+    pub num_definition_fonts: usize,
 
     /// Lazily calculated.
     pub characters: Option<BTreeMap<char, Vec<String>>>,
@@ -909,16 +913,17 @@ pub(super) struct CachedFamily {
     /// render this char in its place.
     pub replacement_char: char,
 
-    /// Cache: `char → which face in the fallback chain owns this char`.
+    /// Cache: `(where to look first, char) → which face in the fallback chain owns this char`.
     ///
     /// Location-independent (fallback choice depends only on charmap support,
     /// not on variation coordinates).
-    pub face_cache: ahash::HashMap<char, FontFaceKey>,
+    pub face_cache: ahash::HashMap<(GlyphSource, char), FontFaceKey>,
 }
 
 impl CachedFamily {
     fn new(
         fonts: Vec<FontFaceKey>,
+        num_definition_fonts: usize,
         fonts_by_id: &mut nohash_hasher::IntMap<FontFaceKey, FontFace>,
     ) -> Self {
         const PRIMARY_REPLACEMENT_CHAR: char = '◻'; // white medium square
@@ -927,6 +932,7 @@ impl CachedFamily {
         if fonts.is_empty() {
             return Self {
                 fonts,
+                num_definition_fonts,
                 characters: None,
                 replacement_face_key: FontFaceKey::INVALID,
                 replacement_char: PRIMARY_REPLACEMENT_CHAR,
@@ -936,6 +942,7 @@ impl CachedFamily {
 
         let mut slf = Self {
             fonts,
+            num_definition_fonts,
             characters: None,
             replacement_face_key: FontFaceKey::INVALID,
             replacement_char: PRIMARY_REPLACEMENT_CHAR,
@@ -970,7 +977,16 @@ impl CachedFamily {
         c: char,
         fonts_by_id: &mut nohash_hasher::IntMap<FontFaceKey, FontFace>,
     ) -> Option<FontFaceKey> {
-        for font_key in &self.fonts {
+        Self::find_face_for_char_in(&self.fonts, c, fonts_by_id)
+    }
+
+    /// The first of `fonts` whose charmap supports `c`.
+    pub(crate) fn find_face_for_char_in(
+        fonts: &[FontFaceKey],
+        c: char,
+        fonts_by_id: &mut nohash_hasher::IntMap<FontFaceKey, FontFace>,
+    ) -> Option<FontFaceKey> {
+        for font_key in fonts {
             let font_face = fonts_by_id.get_mut(font_key).expect("Nonexistent font ID");
             if font_face.glyph_id_resolution(c).is_some() {
                 return Some(*font_key);
@@ -1438,6 +1454,7 @@ impl FontsImpl {
                 .collect();
 
             // Fonts found by the providers come after the ones in the definitions:
+            let num_definition_fonts = fonts.len();
             for insert in &self.provided_fonts.inserts {
                 if insert.families.iter().any(|f| f.family == *family)
                     && let Some(key) = self.fonts_by_name.get(&insert.name)
@@ -1447,7 +1464,7 @@ impl FontsImpl {
                 }
             }
 
-            CachedFamily::new(fonts, &mut self.fonts_by_id)
+            CachedFamily::new(fonts, num_definition_fonts, &mut self.fonts_by_id)
         });
         Font {
             fonts_by_id: &mut self.fonts_by_id,
@@ -1923,6 +1940,61 @@ mod font_provider_tests {
 
         let glyph = first_glyph(&mut fonts, EMOJI);
         assert!(!glyph.is_color, "Should come from the provided font");
+        assert_eq!(requests.lock().len(), 1);
+    }
+
+    #[test]
+    fn emoji_presentation_prefers_provided_fonts_over_definitions() {
+        // Hack and NotoEmoji from the definitions, emoji-icon-font from the provider.
+        // Both emoji fonts have 🚀.
+        let mut definitions = hack_only();
+        definitions.font_data.insert(
+            "NotoEmoji-Regular".to_owned(),
+            Arc::new(FontData::from_static(NOTO_EMOJI_REGULAR)),
+        );
+        definitions.families.insert(
+            FontFamily::Proportional,
+            vec!["Hack".to_owned(), "NotoEmoji-Regular".to_owned()],
+        );
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let provider = {
+            let requests = Arc::clone(&requests);
+            Arc::new(move |request: &FallbackRequest<'_>| {
+                requests.lock().push(request.cluster.to_owned());
+                Some(FontInsert::new(
+                    "provided:emoji-icon-font",
+                    FontData::from_static(EMOJI_ICON),
+                    vec![],
+                ))
+            })
+        };
+        let mut fonts = Fonts::new(TextOptions::default(), definitions, None)
+            .with_font_providers(vec![provider]);
+        let font_id = FontId::proportional(14.0);
+        let mut layout = |text: &str| {
+            let galley = fonts.with_pixels_per_point(1.0).layout_no_wrap(
+                text.to_owned(),
+                font_id.clone(),
+                Color32::WHITE,
+            );
+            galley.rows[0].row.glyphs[0].uv_rect
+        };
+
+        // Text presentation: NotoEmoji from the definitions wins, and the provider is not asked.
+        let text_presentation = layout("🚀\u{FE0E}");
+        assert!(requests.lock().is_empty());
+
+        // Emoji presentation: the provider is asked first, even though NotoEmoji has the glyph.
+        let emoji_presentation = layout("🚀");
+        assert_eq!(*requests.lock(), ["🚀"]);
+        assert_ne!(
+            emoji_presentation.min, text_presentation.min,
+            "Should be different glyphs, from different fonts"
+        );
+
+        // Both are cached:
+        layout("🚀\u{FE0E}");
+        layout("🚀");
         assert_eq!(requests.lock().len(), 1);
     }
 

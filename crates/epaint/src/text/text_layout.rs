@@ -212,6 +212,7 @@ struct TextRun {
     ///
     /// [`GlyphSource::Platform`]: try the glyph rasterizer (if any) for each cluster,
     /// shaping with `font_key` only if that fails.
+    /// `font_key` is then a provided font, if one has the glyph.
     source: GlyphSource,
 }
 
@@ -1488,8 +1489,8 @@ fn segment_into_runs(font: &mut Font<'_>, text: &str, out: &mut Vec<TextRun>) {
         let byte_end = byte_offset + grapheme_str.len();
 
         let base_char = grapheme_str.chars().next().unwrap_or(' ');
-        let font_key = font.resolve_cluster_face(grapheme_str, base_char);
         let source = (font.glyph_source_preference)(grapheme_str);
+        let font_key = font.resolve_cluster_face(grapheme_str, base_char, source);
 
         if let Some(last_run) = out.last_mut()
             && last_run.font_key == font_key
