@@ -1225,6 +1225,13 @@ impl FontsView<'_> {
         self.fonts.definitions.families.keys().cloned().collect()
     }
 
+    /// The fonts found by the [`FontProvider`]s so far, in the order they were found.
+    ///
+    /// These are not part of [`Self::definitions`].
+    pub fn provided_fonts(&self) -> &[FontInsert] {
+        &self.fonts.provided_fonts.inserts
+    }
+
     /// Layout some text.
     ///
     /// This is the most advanced layout function.
